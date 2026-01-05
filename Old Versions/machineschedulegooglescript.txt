@@ -1,0 +1,350 @@
+/***************************
+ *  CONFIG & HOLIDAYS LIST
+ ***************************/
+const WORK_START_HOUR = 8, WORK_START_MIN = 30;   // 8:30 AM
+const WORK_END_HOUR   = 16, WORK_END_MIN   = 30;  // 4:30 PM
+const HOLIDAYS = [
+  "01/01/2025","01/20/2025","02/17/2025","05/26/2025",
+  "06/19/2025","07/04/2025","09/01/2025","10/13/2025",
+  "11/11/2025","11/26/2025","11/27/2025","11/28/2025",
+  "12/24/2025","12/25/2025","12/26/2025"
+];
+
+/*************************************
+ *  WORK-TIME ADVANCEMENT HELPERS
+ *************************************/
+function sanitizeDate(input) {
+  if (input instanceof Date && !isNaN(input.getTime())) return input;
+  const dt = new Date();
+  dt.setHours(WORK_START_HOUR, WORK_START_MIN, 0, 0);
+  return dt;
+}
+
+function isWorkMinute(dt) {
+  dt = sanitizeDate(dt);
+  const day = dt.getDay();
+  if (day === 0 || day === 6) return false;
+  const fmt = Utilities.formatDate(dt, SpreadsheetApp.getActive().getSpreadsheetTimeZone(), "MM/dd/yyyy");
+  if (HOLIDAYS.includes(fmt)) return false;
+  const mins = dt.getHours() * 60 + dt.getMinutes();
+  return mins >= WORK_START_HOUR * 60 + WORK_START_MIN && mins < WORK_END_HOUR * 60 + WORK_END_MIN;
+}
+
+function nextWorkdayStart(dt) {
+  dt = sanitizeDate(dt);
+  let d = new Date(dt.getTime() + 24 * 3600 * 1000);
+  const tz = SpreadsheetApp.getActive().getSpreadsheetTimeZone();
+  for (let i = 0; i < 14; i++) {
+    const fmt = Utilities.formatDate(d, tz, "MM/dd/yyyy");
+    const day = d.getDay();
+    if (day >= 1 && day <= 5 && !HOLIDAYS.includes(fmt)) {
+      d.setHours(WORK_START_HOUR, WORK_START_MIN, 0, 0);
+      return d;
+    }
+    d = new Date(d.getTime() + 24 * 3600 * 1000);
+  }
+  throw new Error("No workday found within 2 weeks of " + dt);
+}
+
+function advanceWorkTime(start, hours) {
+  start = sanitizeDate(start);
+  let remMs = hours * 3600 * 1000;
+  let cur = new Date(start);
+  while (remMs > 0) {
+    if (isWorkMinute(cur)) {
+      const eod = new Date(cur);
+      eod.setHours(WORK_END_HOUR, WORK_END_MIN, 0, 0);
+      const chunk = Math.min(remMs, eod - cur);
+      cur = new Date(cur.getTime() + chunk);
+      remMs -= chunk;
+    } else {
+      const wstart = new Date(cur);
+      wstart.setHours(WORK_START_HOUR, WORK_START_MIN, 0, 0);
+      cur = cur < wstart ? wstart : nextWorkdayStart(cur);
+    }
+  }
+  return cur;
+}
+
+/****************************************
+ *  JOB QUEUE BUILDER
+ ****************************************/
+function buildJobQueues(prod, emb) {
+  const headers = prod.getRange(1, 1, 1, prod.getLastColumn()).getValues()[0];
+  const idx = name => {
+    const i = headers.indexOf(name);
+    if (i < 0) throw new Error(`Missing header: ${name}`);
+    return i + 1;
+  };
+  const [cO, cQ, cS, cF, cCo, cD] = [
+    "Order #", "Quantity", "Stitch Count",
+    "Hard Date/Soft Date", "Company Name", "Design"
+  ].map(idx);
+  const cStage = idx("Stage");
+
+  const pRows = prod.getLastRow() > 1
+    ? prod.getRange(2, 1, prod.getLastRow() - 1, prod.getLastColumn()).getValues()
+    : [];
+
+  const eHdrs = emb.getRange(1, 1, 1, emb.getLastColumn()).getValues()[0];
+  const eO = eHdrs.indexOf("Order #") + 1;
+  const eDue = eHdrs.indexOf("Due Date") + 1;
+  if (!eO || !eDue) throw new Error("Embroidery List headers missing");
+  const eRows = emb.getLastRow() > 1
+    ? emb.getRange(2, 1, emb.getLastRow() - 1, emb.getLastColumn()).getValues()
+    : [];
+  const dueMap = {};
+  eRows.forEach(r => {
+    const order = r[eO - 1];
+    let dt = new Date(r[eDue - 1]);
+    if (!order || isNaN(dt)) return;
+    dt.setHours(WORK_END_HOUR, WORK_END_MIN, 0, 0);
+    dueMap[order] = {
+      date: dt,
+      display: Utilities.formatDate(dt, SpreadsheetApp.getActive().getSpreadsheetTimeZone(), "MM/dd")
+    };
+  });
+
+  const year = new Date().getFullYear();
+  const jobs = [];
+  pRows.forEach(r => {
+    const rawStage = r[cStage - 1];
+    const stage = typeof rawStage === 'string' ? rawStage.trim().toLowerCase() : '';
+    if (stage === 'sewing' || stage === 'complete') return;
+    const order = r[cO - 1]; if (!order) return;
+    const qty = Number(r[cQ - 1]) || 0;
+    let stitch = Number(r[cS - 1]); if (!stitch || isNaN(stitch)) stitch = 30000;
+    const flagR = r[cF - 1] || "";
+    const flag = /^hard/i.test(flagR) ? "H" : /^soft/i.test(flagR) ? "S" : flagR;
+    const company = r[cCo - 1] || "";
+    const design = r[cD - 1] || "";
+    const dueObj = dueMap[order] || { date: new Date(year, 11, 31), display: "--/--" };
+    const dueDate = dueObj.date;
+    const dueStr = dueObj.display;
+    const effectiveQty = qty % 6 === 0 ? qty : Math.ceil(qty / 6) * 6;
+    const hours = (stitch / 30000) * (effectiveQty / 6);
+    const display = `${order} – ${company} – ${design} – ${qty} – ${dueStr} – ${flag}`;
+    jobs.push({ order, company, hours, dueDate, display });
+  });
+
+  jobs.sort((a, b) => a.dueDate - b.dueDate);
+  const m1 = [], m2 = [];
+  let lastM = 1, lastO = null, lastC = "";
+  jobs.forEach(job => {
+    const keep = lastO !== null && job.order === lastO + 1 && job.company === lastC;
+    const machine = keep ? lastM : (lastM === 1 ? 2 : 1);
+    (machine === 1 ? m1 : m2).push(job);
+    lastM = machine; lastO = job.order; lastC = job.company;
+  });
+
+  return { m1, m2 };
+}
+
+/****************************************
+ *  MAIN SCHEDULING FUNCTION
+ ****************************************/
+function scheduleWithWorkCalendar() {
+  Logger.clear();
+  const ss = SpreadsheetApp.getActive();
+  ss.toast("🔔 Starting scheduleWithWorkCalendar");
+
+  const prod = ss.getSheetByName("Production Orders");
+  const emb = ss.getSheetByName("Embroidery List");
+  if (!prod || !emb) throw new Error("Missing sheets");
+
+  const { m1, m2 } = buildJobQueues(prod, emb);
+  // Respect scanned-in jobs: move any job with Embroidery Start Time to top of its machine
+  const eHdrs = emb.getRange(1,1,1,emb.getLastColumn()).getValues()[0];
+  const eOrderIdx = eHdrs.indexOf('Order #')+1;
+  const eStartIdx = eHdrs.indexOf('Embroidery Start Time')+1;
+  const eRows2 = emb.getLastRow()>1 ? emb.getRange(2,1,emb.getLastRow()-1,emb.getLastColumn()).getValues() : [];
+  const startMap = {};
+  eRows2.forEach(r=>{ const o=r[eOrderIdx-1], t=r[eStartIdx-1]; if(o && t) startMap[o]=true; });
+  // Move scanned-in job in m1
+  let idx1 = m1.findIndex(j=>startMap[j.order]); if(idx1>=0){ let job=m1.splice(idx1,1)[0]; m1.unshift(job); }
+  // Move scanned-in job in m2
+  let idx2 = m2.findIndex(j=>startMap[j.order]); if(idx2>=0){ let job=m2.splice(idx2,1)[0]; m2.unshift(job); }
+  ss.toast(`Will write ${m1.length + m2.length} jobs`);
+
+  let sched = ss.getSheetByName("Machine Schedule");
+  if (!sched) sched = ss.insertSheet("Machine Schedule");
+  const MR = sched.getMaxRows();
+  if (MR > 1) sched.getRange(2, 1, MR - 1, 6).clear();
+  const needed = Math.max(m1.length, m2.length) + 1;
+  if (sched.getMaxRows() < needed) sched.insertRowsAfter(MR, needed - MR);
+
+  const tz = ss.getSpreadsheetTimeZone();
+  const fmtD = dt => Utilities.formatDate(dt, tz, "MM/dd");
+  const fmtT = dt => Utilities.formatDate(dt, tz, "HH:mm");
+
+  let c1 = new Date(); c1.setHours(WORK_START_HOUR, WORK_START_MIN, 0, 0);
+  let c2 = new Date(c1);
+
+  m1.forEach((job, i) => {
+    const start = advanceWorkTime(c1, i === 0 ? 0 : 0.5);
+    let end = advanceWorkTime(start, job.hours);
+    const em = end.getHours() * 60 + end.getMinutes();
+    const ws = WORK_START_HOUR * 60 + WORK_START_MIN;
+    const we = WORK_END_HOUR * 60 + WORK_END_MIN;
+    const isH = HOLIDAYS.includes(fmtD(end));
+    if (em < ws || em >= we || [0, 6].includes(end.getDay()) || isH) end = nextWorkdayStart(end);
+    c1 = end;
+    const r = 2 + i;
+    sched.getRange(r, 1).setValue(job.display).setHorizontalAlignment('center');
+    sched.getRange(r, 2).setValue(start).setNumberFormat("MM/dd HH:mm").setHorizontalAlignment('center');
+    sched.getRange(r, 3).setValue(end).setNumberFormat("MM/dd HH:mm").setHorizontalAlignment('center');
+    if (end > job.dueDate) sched.getRange(r, 1, 1, 6).setBackground("red").setFontColor("white").setFontWeight("bold");
+  });
+
+  m2.forEach((job, i) => {
+    const start = advanceWorkTime(c2, i === 0 ? 0 : 0.5);
+    let end = advanceWorkTime(start, job.hours);
+    const em = end.getHours() * 60 + end.getMinutes();
+    const ws = WORK_START_HOUR * 60 + WORK_START_MIN;
+    const we = WORK_END_HOUR * 60 + WORK_END_MIN;
+    const isH = HOLIDAYS.includes(fmtD(end));
+    if (em < ws || em >= we || [0, 6].includes(end.getDay()) || isH) end = nextWorkdayStart(end);
+    c2 = end;
+    const r = 2 + i;
+    sched.getRange(r, 4).setValue(job.display).setHorizontalAlignment('center');
+    sched.getRange(r, 5).setValue(start).setNumberFormat("MM/dd HH:mm").setHorizontalAlignment('center');
+    sched.getRange(r, 6).setValue(end).setNumberFormat("MM/dd HH:mm").setHorizontalAlignment('center');
+    if (end > job.dueDate) sched.getRange(r, 4, 1, 3).setBackground("red").setFontColor("white").setFontWeight("bold");
+  });
+
+  ss.toast("✅ scheduleWithWorkCalendar complete");
+  Logger.log("■ scheduleWithWorkCalendar complete");
+}
+
+/**
+ * Installable edit trigger for Embroidery List scans
+ */
+function onEmbroideryListEdit(e) {
+  // DEBUG TOAST
+  SpreadsheetApp.getActive().toast('🛠️ onEmbroideryListEdit fired');
+  const sh = e.range.getSheet();
+  Logger.log(`Trigger onEmbroideryListEdit: sheet=${sh.getName()}, row=${e.range.getRow()}, col=${e.range.getColumn()}`);
+  if (sh.getName() !== 'Embroidery List') return;
+
+  const hdrs = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0];
+  const colName = hdrs[e.range.getColumn()-1];
+  Logger.log(`Edited column name: ${colName}`);
+
+  const startIdx   = hdrs.indexOf('Embroidery Start Time') + 1;
+  const endIdx     = hdrs.indexOf('Embroidery End Time')   + 1;
+  const orderIdx   = hdrs.indexOf('Order #')                + 1;
+  const qtyMadeIdx = hdrs.indexOf('Quantity Made')         + 1;
+  if (e.range.getRow() < 2) return;
+
+  if (e.range.getColumn() === startIdx && e.value) {
+    const order = sh.getRange(e.range.getRow(), orderIdx).getValue();
+    if (order) scanInJob_(order);
+  }
+
+  if (e.range.getColumn() === endIdx && e.value) {
+    const order = sh.getRange(e.range.getRow(), orderIdx).getValue();
+    if (order && qtyMadeIdx) {
+      const ss = SpreadsheetApp.getActive();
+      const prod = ss.getSheetByName('Production Orders');
+      const pHdrs = prod.getRange(1,1,1,prod.getLastColumn()).getValues()[0];
+      const pOrderIdx = pHdrs.indexOf('Order #') + 1;
+      const pQtyIdx   = pHdrs.indexOf('Quantity') + 1;
+      let qtyMade = 0;
+      for (let rr = 2; rr <= prod.getLastRow(); rr++) {
+        if (prod.getRange(rr,pOrderIdx).getValue() === order) {
+          qtyMade = prod.getRange(rr,pQtyIdx).getValue();
+          break;
+        }
+      }
+      sh.getRange(e.range.getRow(), qtyMadeIdx).setValue(qtyMade);
+    }
+}
+}
+function scanInJob_(order) {
+  const ss = SpreadsheetApp.getActive();
+  const sched = ss.getSheetByName('Machine Schedule');
+  const emb = ss.getSheetByName('Embroidery List');
+  let machine, rowIdx;
+  for (let r = 2; r <= sched.getMaxRows(); r++) {
+    const v1 = sched.getRange(r, 1).getValue();
+    if (v1 && v1.toString().startsWith(order)) { machine = 1; rowIdx = r; break; }
+    const v4 = sched.getRange(r, 4).getValue();
+    if (v4 && v4.toString().startsWith(order)) { machine = 2; rowIdx = r; break; }
+  }
+  if (!machine) return;
+
+  const topRow = 2;
+  const colOff = machine === 1 ? 1 : 4;
+  const prevJob = sched.getRange(topRow, colOff).getValue();
+  const prevOrder = prevJob ? prevJob.split(' ')[0] : null;
+  let prevStart;
+  if (prevOrder) {
+    const eHdrs = emb.getRange(1, 1, 1, emb.getLastColumn()).getValues()[0];
+    const eOrderIdx = eHdrs.indexOf('Order #') + 1;
+    const eStartIdx = eHdrs.indexOf('Embroidery Start Time') + 1;
+    for (let rr = 2; rr <= emb.getLastRow(); rr++) {
+      if (emb.getRange(rr, eOrderIdx).getValue() === prevOrder) {
+        prevStart = emb.getRange(rr, eStartIdx).getValue();
+        break;
+      }
+    }
+  }
+
+  const vals = sched.getRange(rowIdx, 1, 1, 6).getValues()[0];
+  sched.deleteRow(rowIdx);
+  sched.insertRowBefore(topRow);
+  sched.getRange(topRow, 1, 1, 6).setValues([vals]).setHorizontalAlignment('center');
+
+  if (!prevStart) {
+    return;
+  }
+
+  const eHdrs2 = emb.getRange(1, 1, 1, emb.getLastColumn()).getValues()[0];
+  const eOrderIdx2 = eHdrs2.indexOf('Order #') + 1;
+  const eEndIdx2 = eHdrs2.indexOf('Embroidery End Time') + 1;
+  for (let rr = 2; rr <= emb.getLastRow(); rr++) {
+    if (emb.getRange(rr, eOrderIdx2).getValue() === prevOrder) {
+      emb.getRange(rr, eEndIdx2).setValue(new Date());
+      break;
+    }
+  }
+
+  scheduleWithWorkCalendar();
+}
+
+/**
+ * processScans: Polls Embroidery List for new scans and processes them.
+ * Use a time-driven trigger (e.g. every minute) to call this function.
+ */
+function processScans() {
+  const ss = SpreadsheetApp.getActive();
+  const emb = ss.getSheetByName('Embroidery List');
+  const sched = ss.getSheetByName('Machine Schedule');
+  if (!emb || !sched) return;
+
+  const hdrs = emb.getRange(1,1,1,emb.getLastColumn()).getValues()[0];
+  const orderIdx = hdrs.indexOf('Order #') + 1;
+  const startIdx = hdrs.indexOf('Embroidery Start Time') + 1;
+  let procIdx  = hdrs.indexOf('Scan Processed') + 1;
+
+  // Add 'Scan Processed' header if missing
+  if (procIdx === 0) {
+    emb.getRange(1, emb.getLastColumn()+1).setValue('Scan Processed');
+    hdrs.push('Scan Processed');
+    procIdx = hdrs.indexOf('Scan Processed') + 1;
+  }
+
+  const rows = emb.getLastRow() - 1;
+  if (rows < 1) return;
+  const data = emb.getRange(2,1,rows, emb.getLastColumn()).getValues();
+
+  data.forEach((row,i) => {
+    const order = row[orderIdx-1];
+    const start = row[startIdx-1];
+    const processed = row[procIdx-1];
+    if (order && start && !processed) {
+      scanInJob_(order);
+      emb.getRange(i+2, procIdx).setValue(true);
+    }
+  });
+}

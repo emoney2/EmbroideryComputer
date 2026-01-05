@@ -1,0 +1,21 @@
+credentials.json
+creds.b64
+# local environment variables
+.env
+
+"credentials.json" 
+"credentials.json" 
+
+# Google OAuth secrets
+token.json
+work_credentials.json
+credentials.json
+*.pem
+*.p12
+
+# OS/editor
+.DS_Store
+Thumbs.db
+new.json
+token.json
+token.b64.txt
